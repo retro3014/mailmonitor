@@ -1,0 +1,27 @@
+{
+  "blocking_enabled": true,
+  "description": "메일 발송 차단 정책 설정 파일",
+  "rules": [
+    {
+      "name": "resident_registration_number",
+      "description": "주민등록번호 패턴 (YYMMDD-NNNNNNN)",
+      "pattern": "\\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\\d|3[01])[-\\s]?[1-4]\\d{6}",
+      "threshold": 2,
+      "enabled": true
+    },
+    {
+      "name": "credit_card_number",
+      "description": "신용카드 번호 패턴 (16자리, 하이픈 구분 포함)",
+      "pattern": "\\d{4}[-\\s]?\\d{4}[-\\s]?\\d{4}[-\\s]?\\d{4}",
+      "threshold": 3,
+      "enabled": false
+    },
+    {
+      "name": "phone_number",
+      "description": "휴대전화 번호 패턴 (010-XXXX-XXXX)",
+      "pattern": "01[016789][-\\s]?\\d{3,4}[-\\s]?\\d{4}",
+      "threshold": 5,
+      "enabled": false
+    }
+  ]
+}

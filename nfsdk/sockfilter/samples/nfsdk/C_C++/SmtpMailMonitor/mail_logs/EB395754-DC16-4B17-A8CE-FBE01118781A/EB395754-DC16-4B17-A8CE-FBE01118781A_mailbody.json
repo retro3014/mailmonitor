@@ -1,0 +1,37 @@
+{
+  "id": "EB395754-DC16-4B17-A8CE-FBE01118781A",
+  "subject": "[TEST] SmtpMailMonitor Test Email",
+  "from": "Test Sender <sender@test.com>",
+  "recipients": {
+    "to": "Test Receiver <receiver@test.com>",
+    "cc": "",
+    "bcc": "",
+    "smtp_rcpt_to": [
+      "receiver@test.com"
+    ]
+  },
+  "date": "Tue, 07 Apr 2026 12:00:00 +0900",
+  "send_timestamp": "2026-04-07T22:11:33+09:00",
+  "message_id": "<test-msg-002@smtptest.local>",
+  "mime_version": "1.0",
+  "content_type": "text/plain; charset=UTF-8",
+  "reply_to": "",
+  "x_mailer": "SmtpTestSender/1.0",
+  "importance": "",
+  "smtp_envelope_from": "sender@test.com",
+  "body_plain_text": "This is a test email sent by SmtpTestSender.\r\nThis email is used to verify SmtpMailMonitor functionality.\r\n\r\nFeatures being tested:\r\n  1. Email content JSON logging\r\n  2. Header parsing (Subject, From, To, Date, etc.)\r\n  3. Body content extraction\r\n\r\n-- End of test email --\r\n",
+  "body_html": "",
+  "raw_data_size": 603,
+  "attachment_count": 0,
+  "attachments": [],
+  "extra_headers": {},
+  "block_info": {
+    "blocked": false
+  },
+  "network_info": {
+    "source_ip": "192.168.219.104:56649",
+    "destination_ip": "192.168.219.104:25",
+    "process_name": "C:\\Users\\jerom\\nfsdk\\sockfilter\\samples\\nfsdk\\C_C++\\SmtpMailMonitor\\Debug\\x64\\SmtpTestSender.exe",
+    "process_id": 16604
+  }
+}

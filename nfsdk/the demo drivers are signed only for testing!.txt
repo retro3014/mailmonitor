@@ -1,0 +1,8 @@
+For Windows 7 and later versions of the Windows family of operating systems, kernel-mode software must have a digital signature to load on x64-based computer systems. 
+The included demo versions of the drivers are signed. But the drivers in Standard and Full sources versions are not signed.
+
+The Microsoft Trusted Root Program no longer supports root certificates that have kernel mode signing capabilities:
+https://docs.microsoft.com/en-us/windows-hardware/drivers/install/deprecation-of-software-publisher-certificates-and-commercial-release-certificates 
+
+For the end-user software you have to obtain the Code Signing certificate and sign the driver using Microsoft DevPortal as described here:
+https://netfiltersdk.com/help/nfsdk_wfp/signing.html

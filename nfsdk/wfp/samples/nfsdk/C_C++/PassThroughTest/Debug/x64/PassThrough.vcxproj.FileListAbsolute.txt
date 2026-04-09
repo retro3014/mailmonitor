@@ -1,0 +1,2 @@
+C:\nfsdk\wfp\samples\nfsdk\C_C++\PassThroughTest\Debug\x64\PassThrough.exe
+C:\Users\jerom\nfsdk\wfp\samples\nfsdk\C_C++\PassThroughTest\Debug\x64\PassThrough.exe
