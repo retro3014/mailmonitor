@@ -412,6 +412,15 @@ static void relaySmtpData(SSL* clientSsl, SSL* serverSsl,
                 printf("  From: %s\n", email.from.c_str());
                 printf("  To: %s\n", email.to.c_str());
                 printf("  Attachments: %d\n", (int)email.attachments.size());
+                for (size_t k = 0; k < email.attachments.size(); k++)
+                {
+                    const AttachmentInfo& att = email.attachments[k];
+                    printf("    [%d] %s (%zu bytes, %s)\n",
+                        (int)(k + 1),
+                        att.filename.empty() ? "(no name)" : att.filename.c_str(),
+                        att.data.size(),
+                        att.contentType.empty() ? "unknown" : att.contentType.c_str());
+                }
                 printf("========================================\n");
 
                 // PII check
@@ -788,6 +797,154 @@ static std::string extractNextQuotedString(const std::string& data, size_t& pos)
     return result;
 }
 
+// Heuristic: does this quoted string look like an attachment filename?
+// Used for Gmail web compose data (attachments referenced by filename only).
+static bool looksLikeAttachmentFilename(const std::string& s)
+{
+    if (s.size() < 4 || s.size() > 200) return false;
+    if (s.find("://") != std::string::npos) return false;
+    if (s.find('@') != std::string::npos) return false;
+    if (s.find('/') != std::string::npos) return false;
+    if (s.find('\\') != std::string::npos) return false;
+    if (s.find('<') != std::string::npos) return false;
+    if (s.find('>') != std::string::npos) return false;
+    if (s.find('\n') != std::string::npos) return false;
+
+    size_t dotPos = s.rfind('.');
+    if (dotPos == std::string::npos || dotPos == 0 || dotPos == s.size() - 1)
+        return false;
+
+    size_t extLen = s.size() - dotPos - 1;
+    if (extLen < 2 || extLen > 8) return false;
+
+    for (size_t i = dotPos + 1; i < s.size(); i++)
+    {
+        if (!isalnum((unsigned char)s[i])) return false;
+    }
+
+    static const char* knownExts[] = {
+        "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+        "txt", "csv", "rtf", "odt", "ods", "odp",
+        "zip", "rar", "7z", "tar", "gz", "tgz",
+        "png", "jpg", "jpeg", "gif", "bmp", "webp", "svg", "tiff", "tif",
+        "mp4", "mov", "avi", "mkv", "wmv", "flv", "webm",
+        "mp3", "wav", "ogg", "flac", "m4a",
+        "hwp", "hwpx",
+        "json", "xml", "html", "htm",
+        "exe", "msi",
+        NULL
+    };
+
+    std::string ext = s.substr(dotPos + 1);
+    for (size_t i = 0; i < ext.size(); i++)
+        ext[i] = (char)tolower((unsigned char)ext[i]);
+
+    for (int i = 0; knownExts[i] != NULL; i++)
+    {
+        if (ext == knownExts[i]) return true;
+    }
+    return false;
+}
+
+// Guess MIME type from filename extension (Gmail web doesn't expose
+// content-type for attachments in compose data)
+static std::string guessContentTypeFromExt(const std::string& filename)
+{
+    size_t dot = filename.rfind('.');
+    if (dot == std::string::npos) return "application/octet-stream";
+
+    std::string ext = filename.substr(dot + 1);
+    for (size_t i = 0; i < ext.size(); i++)
+        ext[i] = (char)tolower((unsigned char)ext[i]);
+
+    if (ext == "pdf") return "application/pdf";
+    if (ext == "doc") return "application/msword";
+    if (ext == "docx") return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    if (ext == "xls") return "application/vnd.ms-excel";
+    if (ext == "xlsx") return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+    if (ext == "ppt") return "application/vnd.ms-powerpoint";
+    if (ext == "pptx") return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+    if (ext == "txt") return "text/plain";
+    if (ext == "csv") return "text/csv";
+    if (ext == "json") return "application/json";
+    if (ext == "xml") return "application/xml";
+    if (ext == "zip") return "application/zip";
+    if (ext == "rar") return "application/vnd.rar";
+    if (ext == "7z") return "application/x-7z-compressed";
+    if (ext == "png") return "image/png";
+    if (ext == "jpg" || ext == "jpeg") return "image/jpeg";
+    if (ext == "gif") return "image/gif";
+    if (ext == "bmp") return "image/bmp";
+    if (ext == "webp") return "image/webp";
+    if (ext == "svg") return "image/svg+xml";
+    if (ext == "mp4") return "video/mp4";
+    if (ext == "mov") return "video/quicktime";
+    if (ext == "avi") return "video/x-msvideo";
+    if (ext == "mp3") return "audio/mpeg";
+    if (ext == "wav") return "audio/wav";
+    if (ext == "hwp") return "application/x-hwp";
+    if (ext == "hwpx") return "application/haansofthwpx";
+    return "application/octet-stream";
+}
+
+// Extract attachment metadata from Gmail compose data.
+// Gmail web only includes filenames in the compose stream — actual file
+// bytes are uploaded via separate /upload/ endpoints, so we record the
+// filename and a guessed MIME type only.
+//
+// Bounded scanner: relay buffer can hold up to 64KB of mixed text/binary
+// (Gmail multiplexes compose JSON with file-upload chunks on the same TLS
+// stream). A naive whole-buffer quoted-string scan goes O(N^2) on
+// unterminated quotes from binary, so we cap both the scanned region and
+// the per-quoted-string scan length.
+static void extractGmailAttachments(const std::string& data, ParsedEmail& email)
+{
+    const size_t MAX_SCAN = 32768;       // hard cap on bytes scanned
+    const size_t MAX_QUOTED_LEN = 256;   // attachment filenames fit easily
+
+    size_t scanLen = data.size() < MAX_SCAN ? data.size() : MAX_SCAN;
+
+    std::set<std::string> seen;
+    size_t pos = 0;
+    while (pos < scanLen)
+    {
+        size_t qStart = data.find('"', pos);
+        if (qStart == std::string::npos || qStart >= scanLen) break;
+
+        size_t maxEnd = qStart + 1 + MAX_QUOTED_LEN;
+        if (maxEnd > scanLen) maxEnd = scanLen;
+
+        size_t qEnd = std::string::npos;
+        for (size_t i = qStart + 1; i < maxEnd; i++)
+        {
+            if (data[i] == '\\' && i + 1 < maxEnd) { i++; continue; }
+            if (data[i] == '"') { qEnd = i; break; }
+        }
+
+        if (qEnd == std::string::npos)
+        {
+            // Unterminated within bound — skip past this quote
+            pos = qStart + 1;
+            continue;
+        }
+
+        std::string s = data.substr(qStart + 1, qEnd - qStart - 1);
+        s = GmailWebParser::decodeUnicodeEscapes(s);
+
+        if (looksLikeAttachmentFilename(s) && seen.find(s) == seen.end())
+        {
+            seen.insert(s);
+            AttachmentInfo att;
+            att.filename = s;
+            att.contentType = guessContentTypeFromExt(s);
+            // att.data left empty: bytes not present in compose endpoint
+            email.attachments.push_back(att);
+        }
+
+        pos = qEnd + 1;
+    }
+}
+
 // Parse Gmail compose/send data to extract sender, recipient, subject, body.
 // Gmail format (observed):
 //   [...[1,"sender@email.com","SenderName",...,"sender@email.com"],
@@ -917,6 +1074,7 @@ struct PendingDetection
     std::string recipient, recipientName;
     std::string subject, bodyPlain, bodyHtml;
     std::string sourceInfo, destInfo;
+    std::vector<AttachmentInfo> attachments;
     time_t lastUpdate;
     bool logged;
 
@@ -939,6 +1097,7 @@ static void flushPendingDetection(PendingDetection& det)
     email.smtpRcptTo.push_back(det.recipient);
     email.subject = det.subject;
     email.bodyPlainText = det.bodyPlain;
+    email.attachments = det.attachments;
 
     // Print detection
     printf("\n========================================\n");
@@ -950,6 +1109,29 @@ static void flushPendingDetection(PendingDetection& det)
     printf("  Body: %.200s%s\n",
         det.bodyPlain.empty() ? "(empty)" : det.bodyPlain.c_str(),
         det.bodyPlain.size() > 200 ? "..." : "");
+    if (!det.attachments.empty())
+    {
+        printf("  Attachments: %d\n", (int)det.attachments.size());
+        for (size_t k = 0; k < det.attachments.size(); k++)
+        {
+            const AttachmentInfo& att = det.attachments[k];
+            if (att.data.empty())
+            {
+                printf("    [%d] %s (no body captured, %s)\n",
+                    (int)(k + 1),
+                    att.filename.empty() ? "(no name)" : att.filename.c_str(),
+                    att.contentType.empty() ? "unknown" : att.contentType.c_str());
+            }
+            else
+            {
+                printf("    [%d] %s (%zu bytes, %s)\n",
+                    (int)(k + 1),
+                    att.filename.empty() ? "(no name)" : att.filename.c_str(),
+                    att.data.size(),
+                    att.contentType.empty() ? "unknown" : att.contentType.c_str());
+            }
+        }
+    }
     printf("========================================\n");
 
     // PII check
@@ -999,27 +1181,32 @@ static void checkPendingDetections(int maxAge)
     LeaveCriticalSection(&g_pendingLock);
 }
 
-static void scanForEmailData(std::string& data, const char* direction,
-    const std::string& sourceInfo, const std::string& destInfo)
+// Returns true when a PII block has been triggered for the current
+// detection — caller (relayHttpsData) should then tear down the TLS
+// connection so Gmail's server doesn't receive the rest of the
+// compose POST body and the message isn't actually sent.
+static bool scanForEmailData(std::string& data, const char* direction,
+    const std::string& sourceInfo, const std::string& destInfo,
+    const std::vector<std::pair<std::string, std::vector<unsigned char> > >& uploads)
 {
     // Only scan CLIENT->SERVER data (outgoing emails)
     if (std::string(direction).find("SERVER") == 0)
-        return;
+        return false;
 
     // Quick check: must contain "msg-a:" (Gmail compose message marker)
     size_t msgaPos = data.find("\"msg-a:");
     if (msgaPos == std::string::npos)
-        return;
+        return false;
 
     // Body marker [[0," must be present
     if (data.find("[[0,\"", msgaPos) == std::string::npos)
-        return;
+        return false;
 
     // Try to parse Gmail compose data
     std::string sender, senderName, recipient, recipientName, subject, bodyHtml;
     if (!parseGmailComposeData(data, sender, senderName,
         recipient, recipientName, subject, bodyHtml))
-        return;
+        return false;
 
     // Decode unicode escapes in subject and body
     subject = GmailWebParser::decodeUnicodeEscapes(subject);
@@ -1033,6 +1220,12 @@ static void scanForEmailData(std::string& data, const char* direction,
     while (!bodyPlain.empty() &&
            (bodyPlain[bodyPlain.size()-1] == ' ' || bodyPlain[bodyPlain.size()-1] == '\n'))
         bodyPlain.erase(bodyPlain.size()-1, 1);
+
+    // Extract attachment metadata (filename + guessed MIME type).
+    // Gmail web doesn't include attachment bytes in the compose stream;
+    // those are uploaded via separate /upload/ endpoints.
+    ParsedEmail tempEmail;
+    extractGmailAttachments(data, tempEmail);
 
     // Initialize pending detection system
     if (!g_pendingInitialized)
@@ -1092,19 +1285,643 @@ static void scanForEmailData(std::string& data, const char* direction,
         det.subject = subject;
         det.bodyPlain = bodyPlain;
         det.bodyHtml = bodyHtml;
+
+        // Build new attachment list, preserving any bytes we previously
+        // matched (so re-runs don't drop captured uploads)
+        std::vector<AttachmentInfo> newAttachments = tempEmail.attachments;
+        for (size_t k = 0; k < newAttachments.size(); k++)
+        {
+            for (size_t m = 0; m < det.attachments.size(); m++)
+            {
+                if (det.attachments[m].filename == newAttachments[k].filename &&
+                    !det.attachments[m].data.empty())
+                {
+                    newAttachments[k].data = det.attachments[m].data;
+                    if (newAttachments[k].contentType.empty() ||
+                        newAttachments[k].contentType == "application/octet-stream")
+                    {
+                        newAttachments[k].contentType = det.attachments[m].contentType;
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Fill remaining empty attachment bodies from captured upload requests,
+        // matching by order (Nth attachment <-> Nth upload).
+        size_t uploadIdx = 0;
+        for (size_t k = 0; k < newAttachments.size(); k++)
+        {
+            if (!newAttachments[k].data.empty()) continue;
+            while (uploadIdx < uploads.size() && uploads[uploadIdx].second.empty())
+                uploadIdx++;
+            if (uploadIdx >= uploads.size()) break;
+            newAttachments[k].data = uploads[uploadIdx].second;
+            const std::string& upCt = uploads[uploadIdx].first;
+            if (!upCt.empty() &&
+                (newAttachments[k].contentType.empty() ||
+                 newAttachments[k].contentType == "application/octet-stream"))
+            {
+                newAttachments[k].contentType = upCt;
+            }
+            uploadIdx++;
+        }
+
+        det.attachments = newAttachments;
         det.sourceInfo = sourceInfo;
         det.destInfo = destInfo;
         det.lastUpdate = time(NULL);
 
-        printf("[Gmail] Detection updated: %s -> %s, subject=\"%.30s\", body=%d bytes\n",
+        // Count attachments with bytes for the debug log
+        int withBytes = 0;
+        for (size_t k = 0; k < det.attachments.size(); k++)
+            if (!det.attachments[k].data.empty()) withBytes++;
+
+        printf("[Gmail] Detection updated: %s -> %s, subject=\"%.30s\", body=%d bytes, attachments=%d (%d with body)\n",
             sender.c_str(), recipient.c_str(),
             subject.empty() ? "(empty)" : subject.c_str(),
-            (int)bodyPlain.size());
+            (int)bodyPlain.size(),
+            (int)det.attachments.size(),
+            withBytes);
+    }
+
+    // Early PII check — if the body, subject, or any text-like
+    // attachment already contains enough RRN matches to hit the
+    // configured threshold, flush the detection (saves JSON with
+    // blocked=true) and signal the caller to tear down the TLS
+    // connection so Gmail's server doesn't get the rest of the
+    // compose POST body.
+    bool shouldClose = false;
+    if (!det.logged &&
+        (!det.bodyPlain.empty() || !det.subject.empty() ||
+         !det.attachments.empty()))
+    {
+        ParsedEmail testEmail;
+        testEmail.bodyPlainText = det.bodyPlain;
+        testEmail.subject = det.subject;
+        // Critical: pass attachments through so checkPiiAndBlock's
+        // buildPiiScanContent can scan their text. Without this, an
+        // attachment-only PII (text in test.txt, none in the body)
+        // slips past the early gate and only gets caught at flush time
+        // — by which point the compose POST has already been forwarded
+        // and the email has been sent.
+        testEmail.attachments = det.attachments;
+
+        std::string ruleName, matchedPattern;
+        int matchCount = 0;
+        if (checkPiiAndBlock(testEmail, ruleName, matchCount, matchedPattern))
+        {
+            printf("\n*** [BLOCKED] Gmail PII detected — closing TLS connection ***\n");
+            printf("  Rule: %s, Matches: %d (threshold reached)\n",
+                ruleName.c_str(), matchCount);
+            printf("  Closing connection so Gmail's server cannot complete the send.\n\n");
+
+            // Flush now: prints the standard detection block and writes
+            // the JSON log with blocked=true via logEmailFromProxy.
+            flushPendingDetection(det);
+            shouldClose = true;
+        }
     }
 
     LeaveCriticalSection(&g_pendingLock);
 
     // Don't clear data - keep accumulating for better detections
+    return shouldClose;
+}
+
+// =============================================
+//  Persistent upload cache (realattid -> body bytes)
+// =============================================
+// Gmail's web client uses the resumable-upload protocol:
+//   1) POST /upload/?...&realattid=f_xxx   (X-Goog-Upload-Command: start)
+//          body = metadata (compose-association); URL carries the realattid
+//   2) POST /upload/?upload_id=...         (X-Goog-Upload-Command: upload)
+//          body = the actual file bytes
+//   3) Later compose POSTs reference "f_xxx" by string
+//
+// If the user attempts to send the same draft twice (e.g., we blocked the
+// first send and they hit "Send" again), Gmail does NOT re-upload — it
+// simply re-references the already-uploaded "f_xxx" in the new compose
+// POST. So our per-connection capturedUploads is empty and we'd lose
+// access to the file content. To fix that, we cache upload bodies
+// globally keyed by realattid the first time we see them, and look them
+// up when a later compose POST references the same id.
+
+static CRITICAL_SECTION g_uploadCacheLock;
+static std::map<std::string, std::vector<unsigned char> > g_uploadCache;
+static bool g_uploadCacheInit = false;
+
+static void initUploadCache()
+{
+    if (!g_uploadCacheInit)
+    {
+        InitializeCriticalSection(&g_uploadCacheLock);
+        g_uploadCacheInit = true;
+    }
+}
+
+static std::string extractRealAttIdFromUrl(const std::string& url)
+{
+    size_t pos = url.find("realattid=");
+    if (pos == std::string::npos) return "";
+    pos += 10;  // strlen("realattid=")
+    size_t end = pos;
+    while (end < url.size() && url[end] != '&' && url[end] != ' ') end++;
+    return url.substr(pos, end - pos);
+}
+
+static void cacheUploadBody(const std::string& realattid,
+    const std::vector<unsigned char>& body)
+{
+    if (realattid.empty() || body.empty()) return;
+    initUploadCache();
+    EnterCriticalSection(&g_uploadCacheLock);
+
+    // Soft cap: when the cache grows large, drop the oldest half. This
+    // is best-effort eviction (std::map iteration order is by key, which
+    // is good enough for a long-running session — realattids look random
+    // enough that the eviction won't always hit the same range).
+    if (g_uploadCache.size() >= 200)
+    {
+        size_t toErase = g_uploadCache.size() / 2;
+        std::map<std::string, std::vector<unsigned char> >::iterator it =
+            g_uploadCache.begin();
+        for (size_t i = 0; i < toErase && it != g_uploadCache.end(); i++)
+            it = g_uploadCache.erase(it);
+    }
+
+    g_uploadCache[realattid] = body;
+    LeaveCriticalSection(&g_uploadCacheLock);
+
+    printf("[Gmail/Cache] Stored upload body for realattid=%s (%zu bytes)\n",
+        realattid.c_str(), body.size());
+}
+
+static bool lookupCachedUploadBody(const std::string& realattid,
+    std::vector<unsigned char>& outBody)
+{
+    if (realattid.empty()) return false;
+    if (!g_uploadCacheInit) return false;
+    bool found = false;
+    EnterCriticalSection(&g_uploadCacheLock);
+    std::map<std::string, std::vector<unsigned char> >::iterator it =
+        g_uploadCache.find(realattid);
+    if (it != g_uploadCache.end())
+    {
+        outBody = it->second;
+        found = true;
+    }
+    LeaveCriticalSection(&g_uploadCacheLock);
+    return found;
+}
+
+// Scan a compose POST body for "f_..." realattid references that look
+// like Gmail attachment ids. Return them in the order they appear.
+static std::vector<std::string> findRealAttIdsInComposeBody(
+    const std::string& body)
+{
+    std::vector<std::string> result;
+    std::set<std::string> seen;
+    size_t pos = 0;
+    while (pos < body.size())
+    {
+        size_t qStart = body.find("\"f_", pos);
+        if (qStart == std::string::npos) break;
+
+        size_t idStart = qStart + 1;  // after the opening quote
+        size_t idEnd = idStart;
+        const size_t MAX_ID_LEN = 96;
+        while (idEnd < body.size() && idEnd - idStart < MAX_ID_LEN)
+        {
+            char c = body[idEnd];
+            if (c == '"') break;
+            if (!isalnum((unsigned char)c) && c != '_' && c != '-' && c != '.')
+                break;
+            idEnd++;
+        }
+
+        if (idEnd > idStart + 2 && idEnd < body.size() && body[idEnd] == '"')
+        {
+            std::string id = body.substr(idStart, idEnd - idStart);
+            if (seen.find(id) == seen.end())
+            {
+                seen.insert(id);
+                result.push_back(id);
+            }
+        }
+
+        pos = idEnd + 1;
+    }
+    return result;
+}
+
+// =============================================
+//  Client->Server stream filter (compose POST body buffering)
+// =============================================
+// Streams non-compose HTTP requests through to Gmail's server byte by
+// byte (so file uploads and other traffic aren't delayed), but holds
+// back the body of compose POST requests (POST .../sync/u/.../i/s)
+// until the body is complete. At that point we run the existing PII
+// scan; if any RRN match exceeds the configured threshold we never
+// forward the body, so Gmail's server receives a truncated request and
+// the message is genuinely not sent.
+
+struct ClientStream
+{
+    enum Phase { READING_HEADERS, BUFFER_COMPOSE_BODY, PASSTHROUGH_BODY };
+    Phase phase;
+    std::string headerBuf;        // accumulating until \r\n\r\n
+    std::string composeBuffer;    // headers + body for an active compose POST
+    int  contentLength;
+    int  bodyRemaining;
+    // Realattid carried from the most recent /upload start command on
+    // this connection — used to key the next /upload upload command's
+    // body bytes when storing them in the global upload cache.
+    std::string pendingRealAttId;
+
+    ClientStream()
+        : phase(READING_HEADERS), contentLength(0), bodyRemaining(0) {}
+};
+
+static int parseContentLengthFromHeaders(const std::string& headers)
+{
+    // Case-insensitive search for Content-Length
+    size_t pos = headers.find("Content-Length:");
+    if (pos == std::string::npos) pos = headers.find("content-length:");
+    if (pos == std::string::npos) pos = headers.find("CONTENT-LENGTH:");
+    if (pos == std::string::npos) return 0;
+
+    size_t valStart = pos + 15;  // strlen("Content-Length:")
+    while (valStart < headers.size() &&
+           (headers[valStart] == ' ' || headers[valStart] == '\t'))
+        valStart++;
+    return atoi(headers.c_str() + valStart);
+}
+
+// True if the request line looks like a Gmail compose-send POST.
+//   POST <path containing /sync/u/ AND /i/s> HTTP/1.1
+static bool isComposeRequestLine(const std::string& firstLine)
+{
+    if (firstLine.find("POST ") != 0) return false;
+    if (firstLine.find("/sync/u/") == std::string::npos) return false;
+    if (firstLine.find("/i/s") == std::string::npos) return false;
+    return true;
+}
+
+// Capture /upload bodies from any HTTP requests parsed out of the
+// forwarded byte stream. Gmail's resumable upload sends the file across
+// two requests:
+//   start   — body = compose-association metadata, URL has realattid
+//   upload  — body = actual file bytes, URL has upload_id (no realattid)
+// We pair them up: remember the realattid from the start command, and
+// when the matching upload command arrives, cache its body globally
+// keyed by that realattid (so a later compose POST that re-references
+// the same realattid can still get the bytes for PII scanning).
+static void absorbUploadRequests(
+    ClientStream& cs,
+    const std::vector<HttpMessage>& reqs,
+    std::vector<std::pair<std::string, std::vector<unsigned char> > >& captured)
+{
+    for (size_t r = 0; r < reqs.size(); r++)
+    {
+        const HttpMessage& req = reqs[r];
+        if (req.isResponse) continue;
+        if (req.url.find("/upload") == std::string::npos) continue;
+
+        std::string lowerCmd;
+        std::map<std::string, std::string>::const_iterator cmdIt =
+            req.headers.find("x-goog-upload-command");
+        if (cmdIt != req.headers.end())
+        {
+            lowerCmd = cmdIt->second;
+            for (size_t i = 0; i < lowerCmd.size(); i++)
+                lowerCmd[i] = (char)tolower((unsigned char)lowerCmd[i]);
+        }
+
+        bool isStart  = lowerCmd.find("start")  != std::string::npos;
+        bool isUpload = lowerCmd.find("upload") != std::string::npos;
+
+        if (isStart)
+        {
+            // Modern Gmail uploads carry no realattid in the URL —
+            // realattid comes from the compose POST body instead, and
+            // we tie it to the upload body in dispatchComposePost.
+            std::string realattid = extractRealAttIdFromUrl(req.url);
+            if (!realattid.empty())
+            {
+                cs.pendingRealAttId = realattid;
+                printf("[Gmail/Cache] start cmd realattid=%s\n",
+                    realattid.c_str());
+            }
+            continue;  // start body is metadata, not the file
+        }
+
+        if (!isUpload)
+        {
+            if (!lowerCmd.empty())
+                printf("[Gmail] Skipped /upload request (cmd=%s, %d bytes)\n",
+                    cmdIt->second.c_str(), (int)req.body.size());
+            continue;
+        }
+
+        if (req.body.empty()) continue;
+
+        std::vector<unsigned char> bytes(req.body.begin(), req.body.end());
+        std::map<std::string, std::string>::const_iterator ctIt =
+            req.headers.find("content-type");
+        std::string ct = (ctIt != req.headers.end()) ? ctIt->second : "";
+        std::map<std::string, std::string>::const_iterator uctIt =
+            req.headers.find("x-goog-upload-header-content-type");
+        if (uctIt != req.headers.end() && !uctIt->second.empty())
+            ct = uctIt->second;
+
+        captured.push_back(std::make_pair(ct, bytes));
+        printf("[Gmail] Captured upload: %d bytes, type=%s, url=%.200s\n",
+            (int)bytes.size(),
+            ct.empty() ? "(none)" : ct.c_str(),
+            req.url.c_str());
+
+        // Best-effort: cache the body by realattid if we happen to
+        // have one. With modern Gmail this usually doesn't fire because
+        // realattid isn't in the upload URL — the actual cache fill
+        // happens later in dispatchComposePost where we can pair the
+        // body with the realattid named in the compose POST.
+        std::string cacheKey = cs.pendingRealAttId;
+        if (cacheKey.empty()) cacheKey = extractRealAttIdFromUrl(req.url);
+        if (!cacheKey.empty())
+        {
+            cacheUploadBody(cacheKey, bytes);
+            cs.pendingRealAttId.clear();
+        }
+    }
+}
+
+// Forward bytes to the server AND feed them to clientHttp so /upload
+// tracking stays in sync.
+static void forwardClientBytes(
+    ClientStream& cs,
+    SSL* serverSsl,
+    HttpStreamParser& clientHttp,
+    std::vector<std::pair<std::string, std::vector<unsigned char> > >& captured,
+    const char* data, int len)
+{
+    if (len <= 0) return;
+    SSL_write(serverSsl, data, len);
+    std::vector<HttpMessage> reqs = clientHttp.feedData(data, len);
+    if (!reqs.empty()) absorbUploadRequests(cs, reqs, captured);
+}
+
+// A compose POST has finished arriving. Run the PII scanner on its body;
+// if it reaches the configured RRN threshold, drop the entire request
+// (the server never sees it -> the message is genuinely not sent).
+// Otherwise forward the buffered request through.
+// Returns true if blocked (caller should tear down the connection).
+static bool dispatchComposePost(
+    ClientStream& cs,
+    SSL* serverSsl,
+    HttpStreamParser& clientHttp,
+    std::vector<std::pair<std::string, std::vector<unsigned char> > >& capturedUploads,
+    const std::string& sourceInfo,
+    const std::string& destInfo)
+{
+    size_t hdrEnd = cs.composeBuffer.find("\r\n\r\n");
+    if (hdrEnd == std::string::npos)
+    {
+        // Should not happen — we only enter BUFFER_COMPOSE_BODY after
+        // seeing \r\n\r\n. Fall back to forwarding.
+        forwardClientBytes(cs, serverSsl, clientHttp, capturedUploads,
+            cs.composeBuffer.data(), (int)cs.composeBuffer.size());
+        cs.composeBuffer.clear();
+        cs.phase = ClientStream::READING_HEADERS;
+        return false;
+    }
+
+    std::string body = cs.composeBuffer.substr(hdrEnd + 4);
+
+    // Drop any stale PendingDetection for this sender->recipient pair so
+    // scanForEmailData evaluates THIS compose POST as a fresh email.
+    {
+        std::string s, sn, r, rn, sj, bh;
+        if (parseGmailComposeData(body, s, sn, r, rn, sj, bh) &&
+            !s.empty() && !r.empty() && g_pendingInitialized)
+        {
+            EnterCriticalSection(&g_pendingLock);
+            g_pendingDetections.erase(s + "->" + r);
+            LeaveCriticalSection(&g_pendingLock);
+        }
+    }
+
+    // Pair realattids (from this compose body) with upload bodies
+    // (from this connection's captures), and persist the association
+    // globally. This is the critical insight: Gmail's modern upload
+    // protocol doesn't put realattid in the upload URL, so we can't
+    // key uploads by realattid at upload time. But on the first send
+    // attempt we DO see both sides — the upload bytes via /upload,
+    // and the realattid that names them via the compose POST body.
+    // Caching the pair now means a later retry (same realattid, no
+    // re-upload) hits the cache and can be PII-scanned.
+    std::vector<std::pair<std::string, std::vector<unsigned char> > > scanUploads
+        = capturedUploads;
+    {
+        std::vector<std::string> ids = findRealAttIdsInComposeBody(body);
+        printf("[Gmail/Cache] Compose body contains %d realattid-like "
+            "reference(s); per-conn captured=%d\n",
+            (int)ids.size(), (int)capturedUploads.size());
+
+        // First pass: cache (realattid -> upload body) pairs. Match
+        // by index (Nth realattid <-> Nth captured upload).
+        size_t pairCount = (ids.size() < capturedUploads.size())
+            ? ids.size() : capturedUploads.size();
+        for (size_t i = 0; i < pairCount; i++)
+        {
+            if (capturedUploads[i].second.empty()) continue;
+            std::vector<unsigned char> existing;
+            if (lookupCachedUploadBody(ids[i], existing)) continue;
+            cacheUploadBody(ids[i], capturedUploads[i].second);
+        }
+
+        // Second pass: for any realattid we don't yet have locally,
+        // try the global cache (handles retry case where Gmail
+        // re-references a previously-uploaded file without re-upload).
+        for (size_t i = 0; i < ids.size(); i++)
+        {
+            std::vector<unsigned char> cached;
+            if (!lookupCachedUploadBody(ids[i], cached))
+            {
+                printf("[Gmail/Cache]   ref[%d]=%s -> not in cache\n",
+                    (int)i, ids[i].c_str());
+                continue;
+            }
+
+            bool already = false;
+            for (size_t k = 0; k < scanUploads.size(); k++)
+            {
+                if (scanUploads[k].second == cached) { already = true; break; }
+            }
+            if (already)
+            {
+                printf("[Gmail/Cache]   ref[%d]=%s -> already in scanUploads "
+                    "(local capture)\n", (int)i, ids[i].c_str());
+                continue;
+            }
+
+            scanUploads.push_back(std::make_pair(std::string(""), cached));
+            printf("[Gmail/Cache]   ref[%d]=%s -> using cached body "
+                "(%zu bytes)\n",
+                (int)i, ids[i].c_str(), cached.size());
+        }
+    }
+
+    // scanForEmailData parses the compose JSON, updates the PendingDetection,
+    // runs the PII regex, and (when blocked) flushes the detection so the
+    // JSON log records blocked=true. Its return value is the block signal.
+    bool blocked = scanForEmailData(body, "CLIENT->SERVER",
+        sourceInfo, destInfo, scanUploads);
+
+    if (blocked)
+    {
+        printf("[Gmail/Block] Compose POST WITHHELD — %d bytes never "
+            "reach Gmail's server. Email is not sent.\n",
+            (int)cs.composeBuffer.size());
+        cs.composeBuffer.clear();
+        cs.phase = ClientStream::READING_HEADERS;
+        return true;
+    }
+
+    // Clean — flush the entire request (headers + body) to the server in
+    // one shot.
+    forwardClientBytes(cs, serverSsl, clientHttp, capturedUploads,
+        cs.composeBuffer.data(), (int)cs.composeBuffer.size());
+    cs.composeBuffer.clear();
+    cs.phase = ClientStream::READING_HEADERS;
+    return false;
+}
+
+// Process one chunk of decrypted client->server bytes. Forwards them
+// to the server one HTTP request at a time, buffering the body of
+// compose POSTs so the PII scanner can decide before the bytes leave
+// the proxy. Returns true if a block was triggered.
+static bool processClientChunk(
+    ClientStream& cs,
+    const char* buf, int n,
+    SSL* serverSsl,
+    HttpStreamParser& clientHttp,
+    std::vector<std::pair<std::string, std::vector<unsigned char> > >& capturedUploads,
+    const std::string& sourceInfo,
+    const std::string& destInfo)
+{
+    int pos = 0;
+    while (pos < n)
+    {
+        if (cs.phase == ClientStream::READING_HEADERS)
+        {
+            int avail = n - pos;
+            const int MAX_HEADER = 65536;
+
+            if ((int)cs.headerBuf.size() + avail > MAX_HEADER)
+            {
+                // Pathological — bail and just forward
+                forwardClientBytes(cs, serverSsl, clientHttp, capturedUploads,
+                    cs.headerBuf.data(), (int)cs.headerBuf.size());
+                forwardClientBytes(cs, serverSsl, clientHttp, capturedUploads,
+                    buf + pos, avail);
+                cs.headerBuf.clear();
+                pos += avail;
+                continue;
+            }
+
+            size_t prevSize = cs.headerBuf.size();
+            cs.headerBuf.append(buf + pos, avail);
+
+            size_t hdrEnd = cs.headerBuf.find("\r\n\r\n");
+            if (hdrEnd == std::string::npos)
+            {
+                pos += avail;
+                continue;  // need more
+            }
+
+            // Parse first line + Content-Length
+            std::string headers = cs.headerBuf.substr(0, hdrEnd);
+            size_t flEnd = headers.find("\r\n");
+            std::string firstLine = (flEnd == std::string::npos)
+                ? headers : headers.substr(0, flEnd);
+            int contentLength = parseContentLengthFromHeaders(headers);
+
+            // How many body bytes did we already read into headerBuf?
+            int bodyAlreadyHave = (int)(cs.headerBuf.size() - hdrEnd - 4);
+            int bodyRemaining = contentLength - bodyAlreadyHave;
+            if (bodyRemaining < 0) bodyRemaining = 0;
+
+            // pos in buf has advanced by `avail` already (we appended the
+            // whole tail of buf into headerBuf).
+            pos += avail;
+
+            if (isComposeRequestLine(firstLine))
+            {
+                printf("[Gmail/Block] Compose POST detected, "
+                    "buffering body (Content-Length=%d) for PII scan\n",
+                    contentLength);
+
+                cs.phase = ClientStream::BUFFER_COMPOSE_BODY;
+                cs.composeBuffer = cs.headerBuf;
+                cs.headerBuf.clear();
+                cs.contentLength = contentLength;
+                cs.bodyRemaining = bodyRemaining;
+
+                if (cs.bodyRemaining <= 0)
+                {
+                    if (dispatchComposePost(cs, serverSsl, clientHttp,
+                        capturedUploads, sourceInfo, destInfo))
+                        return true;
+                }
+            }
+            else
+            {
+                // Normal request — forward what we've accumulated and
+                // switch to streaming mode for the body.
+                forwardClientBytes(cs, serverSsl, clientHttp, capturedUploads,
+                    cs.headerBuf.data(), (int)cs.headerBuf.size());
+                cs.headerBuf.clear();
+
+                if (bodyRemaining > 0)
+                {
+                    cs.phase = ClientStream::PASSTHROUGH_BODY;
+                    cs.bodyRemaining = bodyRemaining;
+                }
+                else
+                {
+                    cs.phase = ClientStream::READING_HEADERS;
+                }
+            }
+        }
+        else if (cs.phase == ClientStream::BUFFER_COMPOSE_BODY)
+        {
+            int avail = n - pos;
+            int toCopy = (avail < cs.bodyRemaining) ? avail : cs.bodyRemaining;
+            cs.composeBuffer.append(buf + pos, toCopy);
+            cs.bodyRemaining -= toCopy;
+            pos += toCopy;
+
+            if (cs.bodyRemaining <= 0)
+            {
+                if (dispatchComposePost(cs, serverSsl, clientHttp,
+                    capturedUploads, sourceInfo, destInfo))
+                    return true;
+            }
+        }
+        else  // PASSTHROUGH_BODY
+        {
+            int avail = n - pos;
+            int toForward = (avail < cs.bodyRemaining) ? avail : cs.bodyRemaining;
+            forwardClientBytes(cs, serverSsl, clientHttp, capturedUploads,
+                buf + pos, toForward);
+            cs.bodyRemaining -= toForward;
+            pos += toForward;
+            if (cs.bodyRemaining <= 0)
+                cs.phase = ClientStream::READING_HEADERS;
+        }
+    }
+    return false;
 }
 
 // Scan raw decrypted data for email-related patterns.
@@ -1125,8 +1942,14 @@ static void relayHttpsData(SSL* clientSsl, SSL* serverSsl,
     int totalClientBytes = 0;
     int totalServerBytes = 0;
 
-    // Accumulate CLIENT data only (outgoing = mail being sent)
-    std::string clientDataBuf;
+    // Stream filter that selectively buffers compose POST bodies so we
+    // can scan for PII before the bytes ever reach Gmail's server.
+    ClientStream cs;
+
+    // HTTP parser for the bytes we DO forward — it's used to surface
+    // /upload request bodies (Gmail attachment file content).
+    HttpStreamParser clientHttp;
+    std::vector<std::pair<std::string, std::vector<unsigned char> > > capturedUploads;
 
     while (running)
     {
@@ -1193,35 +2016,23 @@ static void relayHttpsData(SSL* clientSsl, SSL* serverSsl,
             }
             else
             {
-                // Forward to real server FIRST (priority: don't break uploads)
-                int written = SSL_write(serverSsl, buf, n);
-                if (written <= 0) { running = false; break; }
-
                 totalClientBytes += n;
 
-                // Only accumulate small-to-medium requests for email scanning
-                // Skip accumulation for large transfers (file uploads)
-                if (clientDataBuf.size() < 65536)
-                {
-                    clientDataBuf.append(buf, n);
+                // Hand the chunk to the stream filter. Non-compose requests
+                // are forwarded to Gmail's server immediately byte-by-byte;
+                // compose POST bodies are buffered until complete, scanned,
+                // and either forwarded (clean) or dropped (PII detected).
+                bool blocked = processClientChunk(
+                    cs, buf, n, serverSsl, clientHttp, capturedUploads,
+                    sourceInfo, destInfo);
 
-                    // Scan when we have enough data
-                    if (clientDataBuf.size() > 512)
-                    {
-                        scanForEmailData(clientDataBuf, "CLIENT->SERVER",
-                            sourceInfo, destInfo);
-
-                        // Trim buffer if getting large
-                        if (clientDataBuf.size() > 32768)
-                            clientDataBuf = clientDataBuf.substr(
-                                clientDataBuf.size() - 2048);
-                    }
-                }
-                else if (totalClientBytes % (256 * 1024) == 0)
+                if (blocked)
                 {
-                    // Large transfer in progress (likely file upload)
-                    printf("[Gmail] Large upload in progress (%d KB)...\n",
-                        totalClientBytes / 1024);
+                    // PII block triggered — the compose POST body was never
+                    // forwarded, so Gmail's server doesn't have the message.
+                    // Tear down the TLS connection.
+                    running = false;
+                    break;
                 }
             }
         }
@@ -1252,11 +2063,9 @@ static void relayHttpsData(SSL* clientSsl, SSL* serverSsl,
         }
     }
 
-    // Final scan on remaining client data
-    if (!clientDataBuf.empty())
-        scanForEmailData(clientDataBuf, "CLIENT->SERVER(final)", sourceInfo, destInfo);
-
-    // Flush any pending detections immediately when connection closes
+    // Flush any pending detections immediately when connection closes —
+    // catches detections that were updated but never blocked (i.e., legit
+    // emails that finished forwarding) so their JSON log is saved.
     checkPendingDetections(0);
 
     printf("[Gmail] Session ended (client=%d KB, server=%d KB)\n",

@@ -279,7 +279,9 @@ static int jsonExtractInt(const std::string& json, const std::string& key)
     if (pos == std::string::npos) return 0;
     pos++;
 
-    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t'))
+    while (pos < json.size() &&
+        (json[pos] == ' ' || json[pos] == '\t' ||
+         json[pos] == '\r' || json[pos] == '\n'))
         pos++;
 
     return atoi(json.c_str() + pos);
@@ -296,10 +298,41 @@ static bool jsonExtractBool(const std::string& json, const std::string& key)
     if (pos == std::string::npos) return false;
     pos++;
 
-    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t'))
+    while (pos < json.size() &&
+        (json[pos] == ' ' || json[pos] == '\t' ||
+         json[pos] == '\r' || json[pos] == '\n'))
         pos++;
 
     return (json.substr(pos, 4) == "true");
+}
+
+// Find the matching close delimiter for the open delimiter at `openPos`,
+// respecting JSON quoted strings (so a '}' inside a regex like "\\d{2}"
+// or a ']' inside "[1-9]" doesn't terminate the structure prematurely).
+//   open/close pair: '{' '}'  or  '[' ']'
+static size_t findMatchingDelimiter(const std::string& s, size_t openPos,
+    char open, char close)
+{
+    int depth = 1;
+    bool inString = false;
+    for (size_t i = openPos + 1; i < s.size(); i++)
+    {
+        char c = s[i];
+        if (inString)
+        {
+            if (c == '\\' && i + 1 < s.size()) { i++; continue; }
+            if (c == '"') inString = false;
+            continue;
+        }
+        if (c == '"') { inString = true; continue; }
+        if (c == open) depth++;
+        else if (c == close)
+        {
+            depth--;
+            if (depth == 0) return i;
+        }
+    }
+    return std::string::npos;
 }
 
 // =============================================
@@ -333,8 +366,11 @@ static void loadBlockPolicy(const std::string& policyPath)
     if (rulesPos == std::string::npos) return;
 
     size_t arrStart = json.find('[', rulesPos);
-    size_t arrEnd = json.find(']', arrStart);
-    if (arrStart == std::string::npos || arrEnd == std::string::npos) return;
+    if (arrStart == std::string::npos) return;
+    // Use string-aware matcher — a regex pattern like "[1-9]" contains
+    // ']' inside a quoted string and would fool a naive find(']').
+    size_t arrEnd = findMatchingDelimiter(json, arrStart, '[', ']');
+    if (arrEnd == std::string::npos) return;
 
     std::string rulesStr = json.substr(arrStart, arrEnd - arrStart + 1);
 
@@ -342,7 +378,9 @@ static void loadBlockPolicy(const std::string& policyPath)
     size_t objPos = 0;
     while ((objPos = rulesStr.find('{', objPos)) != std::string::npos)
     {
-        size_t objEnd = rulesStr.find('}', objPos);
+        // Same caveat: a regex like "\\d{2}" contains '}' inside the
+        // pattern string, so we need a string-aware brace matcher.
+        size_t objEnd = findMatchingDelimiter(rulesStr, objPos, '{', '}');
         if (objEnd == std::string::npos) break;
 
         std::string objStr = rulesStr.substr(objPos, objEnd - objPos + 1);
@@ -441,6 +479,93 @@ static PiiCheckResult checkPiiInContent(const std::string& content)
     }
 
     return result;
+}
+
+// True when the attachment looks like a plain-text payload whose raw
+// bytes can be regex-scanned. Binary office formats (PDF / DOCX / XLSX
+// / PPTX / HWP / images / archives) compress or wrap their text and
+// won't yield matches against raw bytes — they need a real text
+// extractor. We skip them rather than scanning noise.
+static bool isTextLikeAttachment(const AttachmentInfo& att)
+{
+    std::string lowerCt = att.contentType;
+    for (size_t i = 0; i < lowerCt.size(); i++)
+        lowerCt[i] = (char)tolower((unsigned char)lowerCt[i]);
+
+    if (lowerCt.find("text/") == 0) return true;
+    if (lowerCt.find("application/json") != std::string::npos) return true;
+    if (lowerCt.find("application/xml") != std::string::npos) return true;
+    if (lowerCt.find("+xml") != std::string::npos) return true;
+    if (lowerCt.find("application/x-yaml") != std::string::npos) return true;
+    if (lowerCt.find("application/javascript") != std::string::npos) return true;
+    if (lowerCt.find("application/x-sh") != std::string::npos) return true;
+
+    // Fallback: filename extension (when content-type is missing or
+    // generic like application/octet-stream)
+    std::string lowerFn = att.filename;
+    for (size_t i = 0; i < lowerFn.size(); i++)
+        lowerFn[i] = (char)tolower((unsigned char)lowerFn[i]);
+
+    static const char* textExts[] = {
+        ".txt", ".csv", ".tsv", ".log", ".json", ".xml",
+        ".yaml", ".yml", ".md", ".html", ".htm", ".css",
+        ".js", ".ts", ".ini", ".conf", ".cfg", ".env",
+        ".sql", ".sh", ".bat", ".ps1", ".py", ".rb",
+        ".java", ".c", ".cpp", ".cc", ".h", ".hpp",
+        ".cs", ".go", ".rs", ".php", ".rtf",
+        NULL
+    };
+    for (int i = 0; textExts[i]; i++)
+    {
+        size_t extLen = strlen(textExts[i]);
+        if (lowerFn.size() >= extLen &&
+            lowerFn.compare(lowerFn.size() - extLen, extLen, textExts[i]) == 0)
+            return true;
+    }
+    return false;
+}
+
+// Build the full text used for PII scanning: body + HTML body + subject,
+// extended with the contents of any text-like attachments. This way a
+// resident registration number sitting inside a .txt / .csv / .json
+// attachment gets caught the same as one in the body.
+static std::string buildPiiScanContent(const ParsedEmail& email)
+{
+    std::string content = email.bodyPlainText + " " + email.bodyHtml;
+    content += " " + email.subject;
+
+    // Cap per-attachment scan size — std::regex can stall on huge
+    // strings, and 10 MB of plain text is already plenty for catching
+    // RRN patterns.
+    const size_t MAX_PER_ATT = 10 * 1024 * 1024;
+
+    for (size_t i = 0; i < email.attachments.size(); i++)
+    {
+        const AttachmentInfo& att = email.attachments[i];
+        if (att.data.empty()) continue;
+
+        if (!isTextLikeAttachment(att))
+        {
+            printf("[Policy] Skip attachment scan (binary/unknown): "
+                "%s (type=%s)\n",
+                att.filename.empty() ? "(no name)" : att.filename.c_str(),
+                att.contentType.empty() ? "unknown" : att.contentType.c_str());
+            continue;
+        }
+
+        size_t scanLen = (att.data.size() < MAX_PER_ATT)
+            ? att.data.size() : MAX_PER_ATT;
+
+        printf("[Policy] Scanning attachment: %s (%zu bytes, type=%s)\n",
+            att.filename.empty() ? "(no name)" : att.filename.c_str(),
+            scanLen,
+            att.contentType.empty() ? "unknown" : att.contentType.c_str());
+
+        content += " ";
+        content.append((const char*)&att.data[0], scanLen);
+    }
+
+    return content;
 }
 
 // =============================================
@@ -618,72 +743,97 @@ static void closeDatabase() {}
 // =============================================
 //  Email logging (JSON + attachment saving)
 // =============================================
+//
+// JSON layout (one file per outgoing mail):
+//   id              : internal unique identifier (GUID)
+//   send_timestamp  : (d) when sent, ISO 8601 with timezone
+//   subject         : (a) mail subject — JsonValue::escapeJson handles encoding
+//   body_plain_text : (b) mail body  — JsonValue::escapeJson handles encoding
+//   body_html       : (b) HTML body, included only when present
+//   from            : sender (omitted if unknown)
+//   recipients      : (c) { to, cc, bcc, smtp_rcpt_to }
+//                     cc/bcc always present (empty string = none)
+//   attachment_count, attachments : (e) attachment metadata + saved paths
+//   mail_headers    : (e) raw mail headers — included only when any are present
+//   smtp            : (e) SMTP envelope info — included only when present
+//   block_info      : (e) PII block result
+//   network_info    : (e) source/destination/process
+//   raw_data_size   : (e) raw transferred size — included only when > 0
 static void logEmail(const ParsedEmail& email, bool blocked, const PiiCheckResult& piiResult,
     const std::string& sourceIp, const std::string& destIp,
     const std::string& processName, DWORD processId)
 {
-    // 1. Generate unique mail ID
+    // Internal unique identifier
     std::string mailId = GuidUtil::generateGuid();
     std::string timestamp = getCurrentTimestamp();
 
-    printf("[LOG] Mail logging start: id=%s, subject=%s\n", mailId.c_str(), email.subject.c_str());
+    printf("[LOG] Mail logging start: id=%s, subject=%s\n",
+        mailId.c_str(), email.subject.c_str());
 
-    // 2. Create mail storage directory
     std::string mailDir = g_logBasePath + "\\" + mailId;
     ensureDirectoryExists(mailDir);
 
-    // 3. Save attachments + collect metadata
+    // (e) Save attachment files + build attachment metadata JSON
     JsonArray attachmentsJson;
-
     for (size_t i = 0; i < email.attachments.size(); i++)
     {
         const AttachmentInfo& att = email.attachments[i];
         std::string attId = GuidUtil::generateGuid();
 
-        // Extract file extension
-        std::string ext = "";
+        std::string ext;
         size_t dotPos = att.filename.rfind('.');
         if (dotPos != std::string::npos)
             ext = att.filename.substr(dotPos);
 
-        // Attachment save path: mailId/mailId_attId.ext
         std::string savedFileName = mailId + "_" + attId + ext;
         std::string savedFilePath = mailDir + "\\" + savedFileName;
 
         writeBinaryToFile(savedFilePath, att.data);
+        printf("[LOG]   Attachment saved: %s (%zu bytes)\n",
+            savedFileName.c_str(), att.data.size());
 
-        printf("[LOG]   Attachment saved: %s (%zu bytes)\n", savedFileName.c_str(), att.data.size());
-
-        // Attachment metadata JSON
         JsonBuilder attJson;
         attJson.add("id", attId);
         attJson.add("filename", att.filename);
         attJson.add("file_size", (__int64)att.data.size());
-        attJson.add("content_type", att.contentType);
-        attJson.add("content_encoding", att.contentEncoding);
-        attJson.add("content_id", att.contentId);
+        if (!att.contentType.empty())
+            attJson.add("content_type", att.contentType);
+        if (!att.contentEncoding.empty())
+            attJson.add("content_encoding", att.contentEncoding);
+        if (!att.contentId.empty())
+            attJson.add("content_id", att.contentId);
         attJson.add("saved_filename", savedFileName);
         attJson.add("saved_path", savedFilePath);
 
         attachmentsJson.push_back(attJson.toValue());
-
-        // SQLite insert
         insertAttachmentLog(attId, mailId, att, savedFilePath);
     }
 
-    // 4. Build recipients JSON
+    // (c) Recipients — to / cc / bcc kept as separate JSON properties.
+    //     Always present (empty string indicates "none") so consumers can
+    //     rely on the shape.
     JsonArray rcptToJson;
     for (size_t i = 0; i < email.smtpRcptTo.size(); i++)
         rcptToJson.push_back(JsonValue(email.smtpRcptTo[i]));
 
     JsonBuilder recipientsJson;
-    recipientsJson.add("to", JsonValue(email.to));
-    recipientsJson.add("cc", JsonValue(email.cc));
-    recipientsJson.add("bcc", JsonValue(email.bcc));
-    recipientsJson.add("smtp_rcpt_to", JsonValue(rcptToJson));
+    recipientsJson.add("to", email.to);
+    recipientsJson.add("cc", email.cc);
+    recipientsJson.add("bcc", email.bcc);
+    if (!rcptToJson.empty())
+        recipientsJson.add("smtp_rcpt_to", JsonValue(rcptToJson));
 
-    // 5. Collect extra headers
-    JsonBuilder extraHeaders;
+    // (e) Mail headers — only those that are populated. Includes the
+    //     well-known fields plus any extra headers we collected.
+    JsonBuilder mailHeaders;
+    if (!email.date.empty())        mailHeaders.add("date", email.date);
+    if (!email.messageId.empty())   mailHeaders.add("message_id", email.messageId);
+    if (!email.replyTo.empty())     mailHeaders.add("reply_to", email.replyTo);
+    if (!email.xMailer.empty())     mailHeaders.add("x_mailer", email.xMailer);
+    if (!email.importance.empty())  mailHeaders.add("importance", email.importance);
+    if (!email.mimeVersion.empty()) mailHeaders.add("mime_version", email.mimeVersion);
+    if (!email.contentType.empty()) mailHeaders.add("content_type", email.contentType);
+
     for (std::map<std::string, std::string>::const_iterator it = email.allHeaders.begin();
         it != email.allHeaders.end(); ++it)
     {
@@ -691,7 +841,6 @@ static void logEmail(const ParsedEmail& email, bool blocked, const PiiCheckResul
         for (size_t i = 0; i < lowerKey.size(); i++)
             lowerKey[i] = (char)tolower((unsigned char)lowerKey[i]);
 
-        // Skip headers already stored as separate fields
         if (lowerKey == "subject" || lowerKey == "from" || lowerKey == "to" ||
             lowerKey == "cc" || lowerKey == "bcc" || lowerKey == "date" ||
             lowerKey == "message-id" || lowerKey == "content-type" ||
@@ -700,10 +849,15 @@ static void logEmail(const ParsedEmail& email, bool blocked, const PiiCheckResul
             lowerKey == "mime-version")
             continue;
 
-        extraHeaders.add(it->first, it->second);
+        mailHeaders.add(it->first, it->second);
     }
 
-    // 6. Block info
+    // (e) SMTP envelope — only when present (Gmail web has no envelope_from)
+    JsonBuilder smtpJson;
+    if (!email.smtpMailFrom.empty())
+        smtpJson.add("envelope_from", email.smtpMailFrom);
+
+    // (e) Block info — always included so consumers know the PII outcome
     JsonBuilder blockInfoJson;
     blockInfoJson.add("blocked", blocked);
     if (blocked)
@@ -713,52 +867,53 @@ static void logEmail(const ParsedEmail& email, bool blocked, const PiiCheckResul
         blockInfoJson.add("matched_pattern", piiResult.matchedPattern);
     }
 
-    // 7. Network/process info
+    // (e) Network / process context
     JsonBuilder networkInfo;
-    networkInfo.add("source_ip", sourceIp);
-    networkInfo.add("destination_ip", destIp);
+    networkInfo.add("source", sourceIp);
+    networkInfo.add("destination", destIp);
     networkInfo.add("process_name", processName);
     networkInfo.add("process_id", (int)processId);
 
-    // 8. Build complete JSON
+    // Assemble the document. Order chosen to match the requirement list:
+    //   id, send_timestamp, subject, body, recipients, attachments, then extras.
     JsonBuilder root;
     root.add("id", mailId);
-    root.add("subject", email.subject);
-    root.add("from", email.from);
-    root.add("recipients", recipientsJson.toValue());
-    root.add("date", email.date);
     root.add("send_timestamp", timestamp);
-    root.add("message_id", email.messageId);
-    root.add("mime_version", email.mimeVersion);
-    root.add("content_type", email.contentType);
-    root.add("reply_to", email.replyTo);
-    root.add("x_mailer", email.xMailer);
-    root.add("importance", email.importance);
-    root.add("smtp_envelope_from", email.smtpMailFrom);
+    root.add("subject", email.subject);
     root.add("body_plain_text", email.bodyPlainText);
-    root.add("body_html", email.bodyHtml);
-    root.add("raw_data_size", (__int64)email.rawDataSize);
+    if (!email.bodyHtml.empty())
+        root.add("body_html", email.bodyHtml);
+    if (!email.from.empty())
+        root.add("from", email.from);
+    root.add("recipients", recipientsJson.toValue());
     root.add("attachment_count", (int)email.attachments.size());
     root.add("attachments", JsonValue(attachmentsJson));
-    root.add("extra_headers", extraHeaders.toValue());
+
+    JsonObject hdrsObj = mailHeaders.build();
+    if (!hdrsObj.empty())
+        root.add("mail_headers", JsonValue(hdrsObj));
+
+    JsonObject smtpObj = smtpJson.build();
+    if (!smtpObj.empty())
+        root.add("smtp", JsonValue(smtpObj));
+
     root.add("block_info", blockInfoJson.toValue());
     root.add("network_info", networkInfo.toValue());
 
-    // 9. Save JSON file
+    if (email.rawDataSize > 0)
+        root.add("raw_data_size", (__int64)email.rawDataSize);
+
+    // Write the JSON file (one file per outgoing mail).
     std::string jsonFileName = mailId + "_mailbody.json";
     std::string jsonFilePath = mailDir + "\\" + jsonFileName;
     std::string jsonContent = root.serialize(0);
 
     if (writeStringToFile(jsonFilePath, jsonContent))
-    {
         printf("[LOG] JSON saved: %s\n", jsonFilePath.c_str());
-    }
     else
-    {
         printf("[ERROR] JSON save failed: %s\n", jsonFilePath.c_str());
-    }
 
-    // 10. SQLite insert
+    // SQLite insert (unchanged)
     std::string blockReasonStr;
     if (blocked)
         blockReasonStr = piiResult.ruleName + " (" + intToStr(piiResult.matchCount) + " matches)";
@@ -772,14 +927,12 @@ static void logEmail(const ParsedEmail& email, bool blocked, const PiiCheckResul
 //  (called from TlsProxy.h proxy threads)
 // =============================================
 
-// Check PII and return whether to block
+// Check PII and return whether to block. Scans body + subject AND the
+// contents of any text-like attachments (see buildPiiScanContent).
 bool checkPiiAndBlock(const ParsedEmail& email, std::string& ruleName,
     int& matchCount, std::string& matchedPattern)
 {
-    std::string combinedContent = email.bodyPlainText + " " + email.bodyHtml;
-    combinedContent += " " + email.subject;
-
-    PiiCheckResult result = checkPiiInContent(combinedContent);
+    PiiCheckResult result = checkPiiInContent(buildPiiScanContent(email));
     ruleName = result.ruleName;
     matchCount = result.matchCount;
     matchedPattern = result.matchedPattern;
@@ -1024,13 +1177,20 @@ class SmtpEventHandler : public NF_EventHandler
             printf("  From: %s\n", email.from.c_str());
             printf("  To: %s\n", email.to.c_str());
             printf("  Attachments: %d\n", (int)email.attachments.size());
+            for (size_t k = 0; k < email.attachments.size(); k++)
+            {
+                const AttachmentInfo& att = email.attachments[k];
+                printf("    [%d] %s (%zu bytes, %s)\n",
+                    (int)(k + 1),
+                    att.filename.empty() ? "(no name)" : att.filename.c_str(),
+                    att.data.size(),
+                    att.contentType.empty() ? "unknown" : att.contentType.c_str());
+            }
             printf("========================================\n");
 
-            // PII check (scan both plain text and HTML body)
-            std::string combinedContent = email.bodyPlainText + " " + email.bodyHtml;
-            combinedContent += " " + email.subject;
-
-            PiiCheckResult piiResult = checkPiiInContent(combinedContent);
+            // PII check — scans body + subject + text-like attachments.
+            PiiCheckResult piiResult =
+                checkPiiInContent(buildPiiScanContent(email));
 
             if (piiResult.shouldBlock)
             {
