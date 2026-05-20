@@ -1,0 +1,13 @@
+{
+  "blocking_enabled": true,
+  "description": "메일 발송 차단 정책 설정 파일",
+  "rules": [
+    {
+      "name": "resident_registration_number",
+      "description": "주민등록번호 패턴 (YYMMDD-NNNNNNN)",
+      "pattern": "\\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\\d|3[01])[-\\s]?[1-4]\\d{6}",
+      "threshold": 2,
+      "enabled": true
+    }
+  ]
+}

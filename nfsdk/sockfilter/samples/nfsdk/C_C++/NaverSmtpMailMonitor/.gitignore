@@ -1,0 +1,43 @@
+# ============================================================
+#  SmtpMailMonitor .gitignore
+# ============================================================
+
+# --- Security-sensitive files (NEVER commit) ---
+*.pem
+*.key
+*.p12
+*.pfx
+ca_key.*
+ca_cert.*
+
+# --- Build output ---
+Debug/
+Release/
+x64/
+Win32/
+*.obj
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.log
+*.tlog
+*.idb
+*.ipch
+*.pch
+*.sdf
+*.suo
+*.user
+*.ncb
+*.opensdf
+.vs/
+ipch/
+
+# --- Runtime output ---
+mail_logs/
+
+# --- OpenSSL runtime DLLs (user must provide) ---
+libssl*.dll
+libcrypto*.dll
